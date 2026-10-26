@@ -423,6 +423,8 @@ struct SiluMulQuantContigParams {
   int64_t hidden_dim;
   uint32_t num_tokens;
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
+  uint32_t scale_stride_m;
+  uint32_t scale_stride_g;
 };
 
 template <
@@ -459,7 +461,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   const auto output = params.output + token_id * params.hidden_dim;
   [[maybe_unused]]
   const auto output_scale = [&] {
-    const auto num_groups = params.hidden_dim / kGroupSize;
     if constexpr (kTransposed) {
       // Physical layout is (G//4_pad, M_pad) int32; each int32 packs 4
       // consecutive UE8M0 exponents for the same token. Byte address:
@@ -467,7 +468,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
       const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
       return base + (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u + (work_id % 4u);
     } else {
-      return params.output_scale + token_id * num_groups + work_id;
+      return params.output_scale + token_id * params.scale_stride_m + work_id * params.scale_stride_g;
     }
   }();
 
@@ -593,12 +594,22 @@ struct SiluAndMulContigPostQuantKernel {
     const auto num_groups = static_cast<uint32_t>(hidden_dim / kGroupSize);
 
     uint32_t scale_row_stride_int32 = 0;
+    uint32_t scale_stride_m = num_groups;
+    uint32_t scale_stride_g = 1;
     if (!transposed) {
       G.set_value(num_groups);
-      TensorMatcher({M, G})  // (M, G) fp32 natural row-major
+      auto SM = SymbolicSize{"scale_stride_m"};
+      auto SG = SymbolicSize{"scale_stride_g"};
+      TensorMatcher({M, G})  // FP32 row-major or TMA-aligned column-major
+          .with_strides({SM, SG})
           .with_dtype<fp32_t>()
           .with_device(device)
           .verify(output_scale);
+      RuntimeCheck(
+          (SM.unwrap() == num_groups && SG.unwrap() == 1) || (SM.unwrap() == 1 && SG.unwrap() >= M.unwrap()),
+          "invalid FP32 scale strides");
+      scale_stride_m = static_cast<uint32_t>(SM.unwrap());
+      scale_stride_g = static_cast<uint32_t>(SG.unwrap());
     } else {
       RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
       RuntimeCheck(num_groups % 4 == 0, "transposed layout requires num_groups % 4 == 0");
@@ -623,6 +634,8 @@ struct SiluAndMulContigPostQuantKernel {
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,
         .scale_row_stride_int32 = scale_row_stride_int32,
+        .scale_stride_m = scale_stride_m,
+        .scale_stride_g = scale_stride_g,
     };
 
     const auto threads_per_row = hidden_dim / 8;

@@ -85,6 +85,7 @@ else:
 
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_FUSE_DG_ACT_QUANT = envs.SGLANG_CP_DG_ACT_QUANT_FUSION.get()
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 
@@ -468,7 +469,43 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.activation == "situ":
+        fused_bf16_quant = (
+            _FUSE_DG_ACT_QUANT
+            and _is_cuda
+            and self.config.activation == "silu"
+            and self.swiglu_limit is not None
+            and not self.config.silu_mul_keep_fp32
+            and not self.use_swizzle
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and scale_block_size == 128
+            and (N // 2) % 256 == 0
+            and N // 2 <= 8192
+        )
+        if fused_bf16_quant:
+            down_input_fp8 = torch.empty(
+                (all_tokens, N // 2),
+                device=gateup_output.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                (all_tokens, N // 2),
+                gateup_output.device,
+                scale_block_size,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=False,
+            )
+            silu_and_mul_contig_post_quant(
+                gateup_output,
+                down_input_fp8,
+                down_input_scale,
+                scale_block_size,
+                swiglu_limit=self.swiglu_limit,
+                round_to_bf16=True,
+                rows_per_cta=4 if N // 2 <= 2048 else 2 if N // 2 <= 4096 else 1,
+            )
+            del gateup_output
+        elif self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
@@ -619,7 +656,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not fused_bf16_quant:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         # The down activation is quantized here, independently of dispatch.
@@ -1003,6 +1040,26 @@ def pre_permute_standard_to_deep_gemm(
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
+    pre_quant = dispatch_output.hidden_states_pre_quant
+    # Other pre-quantized formats retain their existing BF16 dispatch path.
+    if not (
+        isinstance(pre_quant, tuple)
+        and len(pre_quant) == 2
+        and deep_gemm_sm120.use_swizzle()
+        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and quant_info.w13_weight.dtype == torch.float8_e4m3fn
+        and quant_info.block_shape == [128, 128]
+    ):
+        pre_quant = None
+    if pre_quant is not None:
+        q, scale = pre_quant
+        assert q.dtype == torch.float8_e4m3fn and q.is_contiguous()
+        assert q.ndim == 2 and q.shape[1] == hidden_states.shape[1]
+        assert q.shape[0] >= hidden_states.shape[0]
+        assert scale.dtype == torch.float32
+        assert scale.shape == (q.shape[0], q.shape[1] // 128)
+        # The standard pre-quant contract permits padding q/scale rows to four.
+        pre_quant = (q[: hidden_states.shape[0]], scale[: hidden_states.shape[0]])
     # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
     # Feeding it the shared masked/swizzled layout does not raise -- it silently
     # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
@@ -1025,7 +1082,8 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids = topk_weights, topk_ids
 
     if (
-        deep_gemm_sm120.allows_masked_standard_layout()
+        pre_quant is None
+        and deep_gemm_sm120.allows_masked_standard_layout()
         and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
     ):
         output_dtype = (
@@ -1122,15 +1180,19 @@ def pre_permute_standard_to_deep_gemm(
         )
 
         block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-        packed_input_source, packed_input_source_scale = (
-            sglang_per_token_group_quant_fp8(
-                hidden_states,
-                block_k,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        if pre_quant is not None:
+            packed_input_source = pre_quant[0]
+            packed_input_source_scale = pre_quant[1].contiguous()
+        else:
+            packed_input_source, packed_input_source_scale = (
+                sglang_per_token_group_quant_fp8(
+                    hidden_states,
+                    block_k,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
             )
-        )
         # ep_scatter writes every live row and the grouped GEMM's results for
         # the alignment padding are dropped by post_reorder, so the zeroing is
         # dead work -- 174 MB per layer at bs=64. The sibling dispatch path in
@@ -1179,9 +1241,11 @@ def pre_permute_standard_to_deep_gemm(
         expert_alignment=block_e,
         expert_start=expert_start,
     )
-    if packed_input_source is not hidden_states:
+    # Pre-quantized tensors are borrowed: a deferred shared expert may still
+    # consume them after this routed dispatch. Do not dispose their storage.
+    if pre_quant is None and packed_input_source is not hidden_states:
         dispose_tensor(packed_input_source)
-    if packed_input_source_scale is not None:
+    if pre_quant is None and packed_input_source_scale is not None:
         dispose_tensor(packed_input_source_scale)
 
     # Preserve the input when a shared expert or its gate may still use it.

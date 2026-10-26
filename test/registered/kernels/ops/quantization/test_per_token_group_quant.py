@@ -315,10 +315,17 @@ def _ref_silu_mul(x, hidden):
 
 
 @pytest.mark.parametrize(
-    "rows,hidden,rows_per_cta",
-    [(1, 512, 1), (17, 512, 4), (17, 768, 4), (1025, 1024, 4), (3, 8192, 1)],
+    "rows,hidden,rows_per_cta,column_major",
+    [
+        (1, 512, 1, False),
+        (17, 512, 4, False),
+        (17, 768, 4, False),
+        (1025, 1024, 4, False),
+        (3, 8192, 1, False),
+        (17, 512, 4, True),
+    ],
 )
-def test_clamped_bf16_activation_quant_graph(rows, hidden, rows_per_cta):
+def test_clamped_bf16_activation_quant_graph(rows, hidden, rows_per_cta, column_major):
     """The fused path must match BF16 clamp/SwiGLU then FP8 quantization."""
     from sglang.kernels.ops.activation.silu_and_mul_clamp import (
         silu_and_mul_clamp,
@@ -328,7 +335,11 @@ def test_clamped_bf16_activation_quant_graph(rows, hidden, rows_per_cta):
     torch.manual_seed(42)
     x = torch.randn(rows, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 12
     actual_q = torch.empty(rows, hidden, device="cuda", dtype=fp8_dtype)
-    actual_s = torch.empty(rows, hidden // 128, device="cuda", dtype=torch.float32)
+    actual_s = (
+        torch.empty(hidden // 128, (rows + 3) // 4 * 4, device="cuda").t()[:rows]
+        if column_major
+        else torch.empty(rows, hidden // 128, device="cuda", dtype=torch.float32)
+    )
 
     def fused():
         silu_and_mul_contig_post_quant(

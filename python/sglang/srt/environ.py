@@ -1656,6 +1656,7 @@ class Envs:
     SGLANG_KDA_FUSED_QKV_PACK = EnvBool(False)
     # Overlap interleave-CP KDA input all-gather with its BF16 projection in eager.
     SGLANG_CP_KDA_ASYNC_TP = EnvBool(False)
+    SGLANG_CP_DG_ACT_QUANT_FUSION = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
