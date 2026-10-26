@@ -369,6 +369,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
+        mgr._state_layout_rejections = {}
         mgr.kv_args = SimpleNamespace(
             engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
         )
@@ -397,6 +398,22 @@ class TestNixlTransferWorker(CustomTestCase):
         queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(queue)
+
+    def test_layout_rejection_fails_before_any_payload_is_posted(self):
+        mgr = self._make_manager(21)
+        mgr._state_layout_rejections["agent"] = "same physical TP size required"
+        mgr.send_kvcache = MagicMock()
+        mgr.send_aux = MagicMock()
+        mgr.conclude_failure = MagicMock()
+
+        self._run_worker_once(mgr, self._make_chunk(21, [1], is_last_chunk=True))
+
+        mgr.send_kvcache.assert_not_called()
+        mgr.send_aux.assert_not_called()
+        self.assertIn(
+            "same physical TP size",
+            mgr.conclude_failure.call_args.kwargs["failure_reason"],
+        )
 
     def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -1036,6 +1053,55 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             mgr.agent.add_remote_agent(info.agent_metadata)
             mgr._prepare_payload_xfer(info)
         return mgr
+
+    def test_cp_draft_kv_requires_matching_physical_tp(self):
+        """Replicated target KV must not hide incompatible TP-sharded draft KV."""
+        mgr = self._make_manager(["decode"])
+        mgr.is_mla_backend = True
+        mgr.state_tp_size = 4
+        # One target MLA entry followed by draft K/V entries.
+        mgr.kv_args.num_draft_entries = 2
+        mgr.kv_args.kv_data_ptrs.append(0x5000)
+        mgr.kv_args.kv_item_lens.append(16)
+        mgr.kv_args.kv_data_lens.append(64)
+        peer = mgr.decode_kv_args_table["decode"]
+        peer.dst_kv_ptrs.append(0x6000)
+        peer.dst_kv_mem_kinds.append("VRAM")
+        peer.dst_kv_item_lens.append(16)
+        mgr.prep_handles.clear()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.requires_dcp_relayout = MagicMock(return_value=False)
+        mgr.check_peer_aux_buffer_count = MagicMock()
+
+        with (
+            patch.object(mgr, "_init_equal_tp_prep_handle") as prepare,
+            patch.object(mgr, "_init_hetero_tp_prep_handle") as slice_heads,
+            patch.object(mgr, "_prepare_state_xfer") as prepare_state,
+        ):
+            for decode_tp in (2, 8):
+                with self.subTest(decode_tp=decode_tp):
+                    peer.decode_tp_size = decode_tp
+                    with self.assertRaisesRegex(ValueError, "same physical TP size"):
+                        mgr._prepare_payload_xfer(peer)
+                    prepare.assert_not_called()
+                    slice_heads.assert_not_called()
+                    # Registration records the failure rather than letting it
+                    # terminate the shared bootstrap thread.
+                    mgr.decode_kv_args_table.pop("decode", None)
+                    mgr._add_remote_peer(peer)
+                    self.assertIn(
+                        "same physical TP size", mgr._state_layout_rejections["decode"]
+                    )
+                    prepare_state.assert_not_called()
+
+            peer.decode_tp_size = 4
+            mgr._prepare_payload_xfer(peer)
+            self.assertEqual(prepare.call_count, 2)
+            self.assertEqual(
+                prepare.call_args_list[0].args[1], mgr.kv_args.kv_data_ptrs
+            )
+            self.assertEqual(prepare.call_args.kwargs["kv_xfer_lens"], [16, 16, 16])
+            slice_heads.assert_not_called()
 
     def test_failed_room_reloads_the_invalidated_peer_for_later_rooms(self):
         """A peer invalidated mid-room must serve later rooms again, even after

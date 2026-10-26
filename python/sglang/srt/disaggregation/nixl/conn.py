@@ -165,7 +165,7 @@ class _PreparedStatePlan(msgspec.Struct, frozen=True):
     components: Dict[int, _PreparedStateComponent]
 
 
-# A decode stride that differs from the prefill's has no correct transfer path.
+# A peer layout for which there is no correct transfer path.
 class _StateLayoutMismatch(ValueError):
     pass
 
@@ -1480,6 +1480,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return indices
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
+        if (
+            self.kv_args.num_draft_entries
+            # Use the target layout captured before temporary draft TP scopes.
+            and self.state_tp_size != self.attn_tp_size
+            and peer_info.decode_tp_size != self.state_tp_size
+        ):
+            # Target MLA KV is replicated, but appended draft MHA KV is TP
+            # sharded. The whole-entry transfer cannot reslice draft heads.
+            raise _StateLayoutMismatch(
+                "CP/TP-sharing draft KV transfer requires the same physical TP size: "
+                f"prefill={self.state_tp_size}, decode={peer_info.decode_tp_size}"
+            )
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
         # Prefill having more kv items is impossible.
@@ -1679,6 +1691,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         continue
 
                     assert req.agent_name in self.decode_kv_args_table
+                    rejection = self._state_layout_rejections.get(req.agent_name)
+                    if rejection is not None:
+                        raise RuntimeError(
+                            f"NIXL peer layout rejected for {req.agent_name}: {rejection}"
+                        )
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
 
@@ -2043,7 +2060,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.check_peer_aux_buffer_count(
                 agent_name, len(decode_kv_args.dst_aux_ptrs)
             )
-            self._prepare_payload_xfer(decode_kv_args)
+            try:
+                self._prepare_payload_xfer(decode_kv_args)
+            except _StateLayoutMismatch as e:
+                # Reject this peer's requests without killing the bootstrap thread.
+                self._state_layout_rejections[agent_name] = str(e)
+                logger.error("NIXL peer layout rejected: peer=%s %s", agent_name, e)
+                return
             self._prepare_state_xfer(decode_kv_args)
 
     def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
@@ -2051,7 +2074,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # restores it; reload it from the registration we already hold.
         for agent_name in list(room_transfer_infos):
             peer_info = self.decode_kv_args_table.get(agent_name)
-            if peer_info is None:
+            if peer_info is None or agent_name in self._state_layout_rejections:
                 continue
             try:
                 if self.agent.check_remote_metadata(agent_name):

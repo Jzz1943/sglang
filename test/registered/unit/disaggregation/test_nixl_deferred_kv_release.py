@@ -159,6 +159,7 @@ class TestNixlAbortNotification(
         manager._staging_ctx = None
         manager._staging_outstanding = defaultdict(int)
         manager.exceptions = {}
+        manager._state_layout_rejections = {}
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.attn_tp_size = 1

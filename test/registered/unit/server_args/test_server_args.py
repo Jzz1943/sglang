@@ -23,6 +23,7 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
+from sglang.srt.arg_groups.cp_tp_group_sharing_hook import resolve_cp_tp_group_sharing
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     finalize_cuda_graph_prefill_max_context,
@@ -1780,6 +1781,50 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+    def test_glm_cp_dflash_nixl_keeps_topology_restrictions(self):
+        """Allow NIXL prefill without relaxing the PD topology or algorithm gates."""
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Glm5NextForConditionalGeneration"]
+            )
+        )
+        for overrides, error in (
+            ({}, None),
+            ({"disaggregation_transfer_backend": "mooncake"}, None),
+            ({"disaggregation_mode": "decode"}, "disaggregation-mode decode"),
+            ({"speculative_algorithm": "EAGLE"}, "speculative-algorithm != DFLASH"),
+            ({"ep_size": 4}, "ep-size > 1"),
+        ):
+            with self.subTest(overrides=overrides):
+                config = dict(
+                    enable_prefill_cp=True,
+                    cp_strategy="interleave",
+                    attn_cp_size=4,
+                    tp_size=4,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm="DFLASH",
+                )
+                config.update(overrides)
+                args = self._new_cp_args(**config)
+                with (
+                    envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+                    patch(
+                        "sglang.srt.arg_groups.cp_tp_group_sharing_hook.mambaish_config",
+                        return_value=SimpleNamespace(
+                            linear_num_key_heads=16, linear_num_value_heads=16
+                        ),
+                    ),
+                ):
+                    if error is not None:
+                        with self.assertRaisesRegex(ValueError, error):
+                            resolve_cp_tp_group_sharing(args, model)
+                    else:
+                        resolve_cp_tp_group_sharing(args, model)
+                        self.assertTrue(
+                            resolution_result(args, "enable_cp_tp_group_sharing")
+                        )
 
 
 class TestFlashinferA2ADispatchType(CustomTestCase):

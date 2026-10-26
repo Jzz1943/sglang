@@ -85,8 +85,8 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         if cfg.disaggregation_mode != "null":
             unsupported |= {
                 "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
-                "disaggregation-transfer-backend != mooncake": (
-                    cfg.disaggregation_transfer_backend != "mooncake"
+                "disaggregation-transfer-backend not in (mooncake, nixl)": (
+                    cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
                 ),
                 "speculative-algorithm != DFLASH": cfg.speculative_algorithm
                 != "DFLASH",
