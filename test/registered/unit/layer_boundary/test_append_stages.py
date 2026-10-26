@@ -69,6 +69,33 @@ def mixer():
 
 
 class TestAppendStages(CustomTestCase):
+    def test_sparse_ffn_can_own_cp_input_gather(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        with fixture.planning(parallel, dsa_cp=True), layer_stack():
+            _, ffn = append_stages(
+                (declare_attn(tp_group=SumGroup.TP), fixture.Norm()),
+                (
+                    declare_ffn(sparse=True, gathers_attn_cp_input=True),
+                    fixture.Norm(),
+                ),
+            )
+        self.assertEqual(
+            ffn.plan.edges[
+                BatchVariant.CONTEXT_PARALLEL
+            ].incoming.need.gathered_by_compute,
+            frozenset({TokenAxis.ATTN_CP}),
+        )
+        self.assertEqual(
+            ffn.plan.edges[BatchVariant.ORDINARY].incoming.need.gathered_by_compute,
+            frozenset(),
+        )
+
     def test_attention_can_own_cp_input_gather_only_on_cp_extends(self):
         parallel = fixture.parallel_of(
             attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True

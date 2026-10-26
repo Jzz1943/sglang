@@ -507,6 +507,7 @@ def declare_ffn(
     output_complete=False,
     sum_impl=None,
     row_transport=None,
+    gathers_attn_cp_input=False,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -525,6 +526,8 @@ def declare_ffn(
             fused with a reduction it needs anyway; the exit then owes none.
         sum_impl: Model-specific implementation and deferral eligibility of
             the output sum. Cannot be combined with output_complete.
+        gathers_attn_cp_input: The FFN gathers CP rows inside compute. Its
+            declared full-row output and outstanding reduction are unchanged.
 
 
     Returns:
@@ -541,6 +544,7 @@ def declare_ffn(
         output_complete=output_complete,
         sum_impl=sum_impl,
         row_transport=row_transport,
+        gathers_attn_cp_input=gathers_attn_cp_input,
     )
 
 
@@ -681,8 +685,31 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             terminal_accepts_update=stage.terminal
             and takes_pending_update(final_read, stage.update),
         )
+        gathers_cp = (
+            stage.gathers_attn_cp_input and variant is BatchVariant.CONTEXT_PARALLEL
+        )
+        if gathers_cp:
+            parallel = get_parallel()
+            if (
+                not stage.sparse
+                or not parallel.enable_cp_tp_group_sharing
+                or parallel.attn_cp_size != parallel.tp_size
+                or TokenAxis.ATTN_CP in declaration.input.layout.sharded
+            ):
+                raise NotImplementedError(
+                    "compute-owned FFN CP gathering requires a full-TP sparse FFN"
+                )
         declaration = msgspec.structs.replace(
             declaration,
+            input=msgspec.structs.replace(
+                declaration.input,
+                gathered_by_compute=(
+                    declaration.input.gathered_by_compute
+                    | frozenset({TokenAxis.ATTN_CP})
+                    if gathers_cp
+                    else declaration.input.gathered_by_compute
+                ),
+            ),
             output=msgspec.structs.replace(
                 declaration.output,
                 sum_impl=_custom_sum(stage, variant, declaration.output.group),
