@@ -1654,6 +1654,8 @@ class Envs:
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
     # Opt-in BF16 strided Q/K normalization and V packing for Triton KDA prefill.
     SGLANG_KDA_FUSED_QKV_PACK = EnvBool(False)
+    # Overlap interleave-CP KDA input all-gather with its BF16 projection in eager.
+    SGLANG_CP_KDA_ASYNC_TP = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

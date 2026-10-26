@@ -289,6 +289,7 @@ class StageDeclaration:
         reduction: Whether the next stage's input always completes the sum
             (an attention's), or the exit decides (an FFN's or a mixer's).
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
+        gathers_attn_cp_input: Whether compute gathers its CP-sharded input itself.
         tp_group: Group partitioning attention heads. Full TP consumers require
             full token rows, including when TP shares the prefill CP group.
         in_token_order: Whether an attention reads the whole sequence in token
@@ -336,6 +337,7 @@ class StageDeclaration:
     output_transform: Optional[OutputTransform] = None
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
+    gathers_attn_cp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
     in_token_order: bool = False
     dense_tp_size: Optional[int] = None
@@ -436,6 +438,7 @@ def declare_attn(
     update=PLAIN_ADD,
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
+    gathers_attn_cp_input=False,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
@@ -451,6 +454,8 @@ def declare_attn(
         reduction: ALWAYS_PARTIAL for an attention whose sum the next stage's
             input always completes; EXIT_SCOPED for a mixer whose exit decides.
         gathers_attn_tp_input: Whether compute gathers attention-TP input slices itself.
+        gathers_attn_cp_input: Whether compute gathers CP-sharded rows itself on
+            context-parallel extends; other batch variants keep their placement.
         output_transform: Optional operation on the output once its sum is
             complete, before the residual update (a sandwich norm). The next
             stage's input runs it, so no fused add + norm takes that input.
@@ -481,6 +486,7 @@ def declare_attn(
         output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
+        gathers_attn_cp_input=gathers_attn_cp_input,
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
@@ -725,6 +731,10 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
         if get_parallel().attn_dp_size > 1:
             raise NotImplementedError("a token-order attention under attention DP")
         compute_rows = full
+    if stage.gathers_attn_cp_input and variant is BatchVariant.CONTEXT_PARALLEL:
+        if TokenAxis.ATTN_CP in compute_rows.sharded:
+            raise ValueError("a stage gathering CP input must compute on full CP rows")
+        gathers = gathers | frozenset({TokenAxis.ATTN_CP})
     declaration = StageContract(
         InputContract(
             compute_rows,

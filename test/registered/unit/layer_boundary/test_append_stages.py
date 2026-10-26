@@ -69,6 +69,24 @@ def mixer():
 
 
 class TestAppendStages(CustomTestCase):
+    def test_attention_can_own_cp_input_gather_only_on_cp_extends(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True
+        )
+        with fixture.planning(parallel, dsa_cp=True), layer_stack():
+            attention, _ = append_stages(
+                (
+                    declare_attn(tp_group=SumGroup.TP, gathers_attn_cp_input=True),
+                    fixture.Norm(),
+                ),
+                (declare_ffn(sparse=True, next_layer_sparse=True), fixture.Norm()),
+            )
+        cp_input = attention.plan.edges[BatchVariant.CONTEXT_PARALLEL].incoming.need
+        ordinary = attention.plan.edges[BatchVariant.ORDINARY].incoming.need
+        self.assertEqual(cp_input.gathered_by_compute, frozenset({TokenAxis.ATTN_CP}))
+        self.assertEqual(ordinary.gathered_by_compute, frozenset())
+        self.assertNotIn(TokenAxis.ATTN_CP, cp_input.layout.sharded)
+
     def setUp(self):
         self.planning = fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2))
         self.planning.__enter__()

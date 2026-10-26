@@ -60,6 +60,41 @@ class _FakeCPGroup:
 
 
 class TestCPStrategyUnit(CustomTestCase):
+    def test_kda_async_tp_topology_and_compile_fallback(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.cp import async_projection
+
+        topology = dict(
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+            cp_strategy="interleave",
+            attn_cp_size=4,
+            tp_size=4,
+            attn_dp_size=1,
+        )
+        with envs.SGLANG_CP_KDA_ASYNC_TP.override(True):
+            for change, expected in (
+                ({}, True),
+                ({"attn_dp_size": 2}, False),
+                ({"cp_strategy": "zigzag"}, False),
+                ({"enable_cp_tp_group_sharing": False}, False),
+            ):
+                with (
+                    self.subTest(change=change),
+                    patch.object(
+                        async_projection,
+                        "get_parallel",
+                        return_value=SimpleNamespace(**(topology | change)),
+                    ),
+                ):
+                    self.assertEqual(
+                        async_projection.kda_cp_async_tp_enabled(), expected
+                    )
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertIsNone(
+                async_projection.try_kda_cp_async_projection(torch.empty(1, 1), None)
+            )
+
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
 
