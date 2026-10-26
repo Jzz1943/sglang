@@ -25,6 +25,7 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
@@ -53,6 +54,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_fuse_clamp_activation_quant = envs.SGLANG_OPT_MOE_ACT_QUANT_FUSION.get()
 
 
 if _is_cuda:
@@ -698,7 +700,57 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
-    if not fuse_swiglu_interleaved:
+    fuse_clamp_activation_quant = (
+        _fuse_clamp_activation_quant
+        and _is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and use_fp8_w8a8
+        and block_shape is not None
+        and list(block_shape) == [128, 128]
+        and activation == "silu"
+        and is_gated
+        and swiglu_limit == 10
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and a2_scale is None
+        and not filter_expert
+        and not hooks
+        and not fuse_swiglu_interleaved
+        and not gate_up_interleaved
+        # Each thread handles eight values; keep complete warps per row and
+        # no more than 1024 threads per CTA, regardless of expert count/top-k.
+        and 512 <= N <= 16384
+        and N % 512 == 0
+        and num_tokens > 0
+    )
+    if fuse_clamp_activation_quant:
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
+
+        # Keep the up-GEMM's route-major or TMA expert-sorted row order.
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        a2_scale = torch.empty(
+            (total_tokens, N // 256), device=hidden_states.device, dtype=torch.float32
+        )
+        threads_per_row = N // 16
+        rows_per_cta = (
+            4 if threads_per_row <= 256 else (2 if threads_per_row <= 512 else 1)
+        )
+        silu_and_mul_contig_post_quant(
+            intermediate_cache1.view(-1, N),
+            intermediate_cache2,
+            a2_scale,
+            128,
+            swiglu_limit=swiglu_limit,
+            round_to_bf16=True,
+            rows_per_cta=rows_per_cta,
+        )
+    elif not fuse_swiglu_interleaved:
         intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),
             device=hidden_states.device,
@@ -716,8 +768,8 @@ def _fused_moe_kernel_sequence(
     )
 
     # Activation function with multiplication
-    if fuse_swiglu_interleaved:
-        # silu(gate) * up was already applied by the up-GEMM epilogue.
+    if fuse_swiglu_interleaved or fuse_clamp_activation_quant:
+        # Activation was applied by the GEMM epilogue or the quantizer.
         pass
     elif activation == "silu_rounded" and is_gated:
         if _is_cuda:

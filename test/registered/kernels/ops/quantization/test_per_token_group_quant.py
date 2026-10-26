@@ -314,6 +314,51 @@ def _ref_silu_mul(x, hidden):
     return torch.nn.functional.silu(gate.float()).to(x.dtype) * up
 
 
+@pytest.mark.parametrize(
+    "rows,hidden,rows_per_cta",
+    [(1, 512, 1), (17, 512, 4), (17, 768, 4), (1025, 1024, 4), (3, 8192, 1)],
+)
+def test_clamped_bf16_activation_quant_graph(rows, hidden, rows_per_cta):
+    """The fused path must match BF16 clamp/SwiGLU then FP8 quantization."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+        silu_and_mul_clamp,
+        silu_and_mul_contig_post_quant,
+    )
+
+    torch.manual_seed(42)
+    x = torch.randn(rows, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 12
+    actual_q = torch.empty(rows, hidden, device="cuda", dtype=fp8_dtype)
+    actual_s = torch.empty(rows, hidden // 128, device="cuda", dtype=torch.float32)
+
+    def fused():
+        silu_and_mul_contig_post_quant(
+            x,
+            actual_q,
+            actual_s,
+            128,
+            swiglu_limit=10,
+            round_to_bf16=True,
+            rows_per_cta=rows_per_cta,
+        )
+
+    fused()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused()
+    x.normal_(std=12)
+    x[0].zero_()
+    if rows > 1:
+        # Exercise NaNs from padded expert rows and a partial final CTA.
+        x[-1].fill_(float("nan"))
+        x[1, 0] = float("-inf")
+    graph.replay()
+    activated = torch.empty(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    silu_and_mul_clamp(x, activated, 10)
+    expected_q, expected_s = per_token_group_quant(activated, group_size=128)
+    assert torch.equal(actual_q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(actual_s, expected_s)
+
+
 @pytest.mark.parametrize("group_size,hidden", [(32, 1792), (32, 6144), (128, 1024)])
 @pytest.mark.parametrize("swiglu_limit", [None, 10.0])
 def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):

@@ -1452,6 +1452,8 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Fuse clamped SwiGLU and block-FP8 activation quantization in Triton MoE.
+    SGLANG_OPT_MOE_ACT_QUANT_FUSION = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE
