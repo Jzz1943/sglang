@@ -115,6 +115,15 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
         if metadata.graph_num_tokens is not None
         else metadata.total_seq_lens
     )
+    if (
+        size > 1
+        and hidden_states.is_cuda
+        and hidden_states.ndim == 2
+        and hidden_states.is_contiguous()
+    ):
+        from sglang.kernels.ops.attention.cp_reorder import cp_reorder
+
+        return cp_reorder(hidden_states, size, num_tokens)
     return (
         hidden_states.reshape(size, rows, *hidden_states.shape[1:])
         .transpose(0, 1)
@@ -134,11 +143,21 @@ def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows)
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
-    padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
     if metadata.gather_index is not None:
+        padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
         return padded.index_copy_(0, metadata.gather_index, hidden_states)
-    padded[: hidden_states.shape[0]] = hidden_states
     size = get_parallel().attn_cp_size
+    if (
+        size > 1
+        and hidden_states.is_cuda
+        and hidden_states.ndim == 2
+        and hidden_states.is_contiguous()
+    ):
+        from sglang.kernels.ops.attention.cp_reorder import cp_reorder
+
+        return cp_reorder(hidden_states, size, gathered_rows, inverse=True)
+    padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
+    padded[: hidden_states.shape[0]] = hidden_states
     return (
         padded.reshape(-1, size, *hidden_states.shape[1:])
         .transpose(0, 1)
