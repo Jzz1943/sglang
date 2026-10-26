@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -118,6 +119,59 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool():
             kv_cache_store_fp8=False,
             qk_rope_head_dim=64,
             device_sm_major=9,
+        )
+
+
+@pytest.mark.parametrize(
+    "rank,rope,decode,allowed,cache_dim",
+    [
+        (512, 0, "tilelang", True, 512),
+        (256, 0, "tilelang", False, 264),
+        (512, 64, "tilelang", False, 656),
+        (512, 0, "flashmla_kv", False, 528),
+    ],
+)
+def test_q8_raw_fp8_validation_and_pool_layout(rank, rope, decode, allowed, cache_dim):
+    from sglang.srt.mem_cache import kv_cache_configurator as configurator
+
+    kwargs = dict(
+        prefill_impl="flashmla_sparse_q8",
+        decode_impl=decode,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_store_fp8=False,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=rope,
+        device_sm_major=9,
+    )
+    if allowed:
+        _validate_flashmla_sparse_q8_backend(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="unsupported unpacked pool"):
+            _validate_flashmla_sparse_q8_backend(**kwargs)
+
+    model = SimpleNamespace(
+        hf_config=SimpleNamespace(), kv_lora_rank=rank, qk_rope_head_dim=rope
+    )
+    execution = SimpleNamespace(
+        kernel=SimpleNamespace(
+            dsa_prefill_backend="flashmla_sparse_q8", dsa_decode_backend=decode
+        )
+    )
+    with (
+        patch.object(configurator, "is_deepseek_dsa", return_value=True),
+        patch.object(configurator, "_is_hip", False),
+        patch.object(configurator, "get_exec", return_value=execution),
+        patch.object(
+            configurator,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="null"),
+        ),
+    ):
+        assert (
+            configurator.calculate_mla_kv_cache_dim(
+                model_config=model, kv_cache_dtype=torch.float8_e4m3fn
+            )
+            == cache_dim
         )
 
 

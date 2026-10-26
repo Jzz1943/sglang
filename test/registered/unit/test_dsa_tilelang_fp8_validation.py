@@ -23,6 +23,27 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
     def test_cuda_fp8_tilelang_allowed(self, _capability):
         _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "tilelang", hip=False)
 
+    @patch("torch.cuda.get_device_capability", return_value=(9, 0))
+    def test_q8_raw_fp8_nope_pairing(self, _capability):
+        kwargs = dict(hip=False, kv_lora_rank=512, qk_rope_head_dim=0)
+        _check_tilelang_dsa_fp8_kv(
+            "fp8_e4m3", "flashmla_sparse_q8", "tilelang", **kwargs
+        )
+        for override in (
+            {"kv_lora_rank": 256},
+            {"qk_rope_head_dim": 64},
+            {"dcp_size": 2},
+        ):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                _check_tilelang_dsa_fp8_kv(
+                    "fp8_e4m3", "flashmla_sparse_q8", "tilelang", **(kwargs | override)
+                )
+        _capability.return_value = (10, 0)
+        with self.assertRaisesRegex(ValueError, "SM90"):
+            _check_tilelang_dsa_fp8_kv(
+                "fp8_e4m3", "flashmla_sparse_q8", "tilelang", **kwargs
+            )
+
     @patch("torch.cuda.get_device_capability", return_value=(8, 0))
     def test_cuda_fp8_requires_fp8_tensor_cores(self, _capability):
         with self.assertRaisesRegex(ValueError, "SM89"):

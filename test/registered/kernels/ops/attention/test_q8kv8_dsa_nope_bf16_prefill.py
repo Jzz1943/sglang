@@ -1,7 +1,7 @@
 """DSA Q8KV8 sparse prefill on NoPE latents, bf16 KV pools and kpool top-k widths.
 
 Covers the GLM-5.3-Flash geometry: qk_rope_head_dim == 0 (zero-width rope views),
-512-dim bf16 KV rows, and kpool top-k rows of width index_topk + kpool - 1 = 2051.
+512-dim bf16/raw FP8 KV rows, and kpool top-k rows of width index_topk + kpool - 1 = 2051.
 """
 
 from __future__ import annotations
@@ -85,12 +85,17 @@ def test_concat_cast_kv_fp8_pad_writes_rows_and_zero_band(rope, pad_rows):
 
 
 @pytest.mark.skipif(not _fp8_triton_available(), reason="Triton fp8 needs SM>=89")
-@pytest.mark.parametrize("head_dim", [512, 576])
-def test_gather_cast_kv_fp8_pad_paged_matches_torch_cast(head_dim):
+@pytest.mark.parametrize(
+    "head_dim,pool_dtype", [(512, torch.bfloat16), (576, torch.bfloat16), (512, FP8)]
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_gather_cast_kv_fp8_pad_paged_matches_torch_cast(head_dim, pool_dtype, strided):
     """A radix-hit prefix (paged gather) must produce the same fp8 bytes as the
     non-prefix cast of the same rows."""
     slots, rows, pad_rows = 4096, 333, 2176
-    pool = (torch.randn(slots, 1, head_dim, device="cuda") * 50).to(torch.bfloat16)
+    row_width = head_dim * (2 if strided else 1)
+    pool = (torch.randn(slots, 1, row_width, device="cuda") * 50).to(pool_dtype)
+    pool = pool[..., :head_dim]
     idx = torch.randint(0, slots, (rows,), dtype=torch.int32, device="cuda")
     idx[:8] = idx[8]
     out = torch.empty(rows + pad_rows, head_dim, dtype=FP8, device="cuda")
@@ -98,9 +103,16 @@ def test_gather_cast_kv_fp8_pad_paged_matches_torch_cast(head_dim):
     gather_cast_kv_fp8_pad_paged(
         out=out, kv_cache=pool, page_table_1_flattened=idx, nope_dim=NOPE
     )
-    expected = pool.view(-1, head_dim)[idx.long()].to(FP8)
+    expected = pool.to(torch.bfloat16)[idx.long(), 0, :].to(FP8)
     assert torch.equal(_bytes(out[:rows]), _bytes(expected))
     assert (_bytes(out[rows:]) == 0).all()
+    # Reusing a larger buffer must clear stale rows in the new padding band.
+    fewer_rows = rows // 2
+    gather_cast_kv_fp8_pad_paged(
+        out=out, kv_cache=pool, page_table_1_flattened=idx[:fewer_rows], nope_dim=NOPE
+    )
+    assert torch.equal(_bytes(out[:fewer_rows]), _bytes(expected[:fewer_rows]))
+    assert (_bytes(out[fewer_rows:]) == 0).all()
 
 
 def _make_backend():
@@ -143,6 +155,11 @@ def _make_ragged_case(heads: int, seed: int):
                 : 1 + (i * 97) % 257
             ]
             indices[row, : picks.numel()] = (picks + base).to(torch.int32)
+            # Preserve live KPool tails after holes in the history columns.
+            indices[row, -3:] = (
+                torch.arange(seq_len - 3, seq_len, device="cuda", dtype=torch.int32)
+                + base
+            )
             row += 1
         base += seq_len
     q_nope = (torch.randn(tokens, heads, NOPE, generator=gen, device="cuda") * 0.25).to(
@@ -164,8 +181,12 @@ def _torch_reference(q_nope, kv, indices):
 @pytest.mark.skipif(not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90")
 @pytest.mark.parametrize("heads", [16, 64])
 @pytest.mark.parametrize("topk_length", [False, True])
-def test_q8_helper_nope_bf16_pool_kpool_width(heads, topk_length):
+@pytest.mark.parametrize("pool_dtype", [torch.bfloat16, FP8])
+def test_q8_helper_nope_pool_kpool_width(heads, topk_length, pool_dtype):
     q_nope, q_rope, pool, flat, ragged_kv, indices = _make_ragged_case(heads, seed=11)
+    if pool_dtype == FP8:
+        pool = pool.to(FP8)
+        ragged_kv = pool.to(torch.bfloat16)[flat.long(), 0, :]
     backend = _make_backend()
     backend._q8kv8_topk_length_enabled = topk_length
     common = dict(
