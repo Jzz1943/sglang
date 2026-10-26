@@ -1650,6 +1650,8 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Opt-in BF16 strided Q/K normalization and V packing for Triton KDA prefill.
+    SGLANG_KDA_FUSED_QKV_PACK = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

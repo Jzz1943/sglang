@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -82,6 +83,80 @@ def _run_chunk_kda(
 
 
 class TestKdaTrackState(CustomTestCase):
+    @torch.inference_mode()
+    def test_fused_qkv_pack_and_graph(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from sglang.kernels.ops.attention.fla.kda_qkv_pack import (
+            kda_qkv_pack,
+            supports_kda_qkv_pack,
+        )
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+
+        for length, heads in ((1, 2), (65, 16), (2049, 2)):
+            with self.subTest(length=length, heads=heads):
+                mixed = torch.randn(
+                    1, length, 3 * heads * 128, device="cuda", dtype=torch.bfloat16
+                )
+                q, k, v = [x.unflatten(-1, (heads, 128)) for x in mixed.chunk(3, -1)]
+                self.assertTrue(supports_kda_qkv_pack(q, k, v))
+                kda_qkv_pack(q, k, v)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = kda_qkv_pack(q, k, v)
+                mixed.normal_()
+                graph.replay()
+                expected = (
+                    l2norm_fwd(q.contiguous()),
+                    l2norm_fwd(k.contiguous()),
+                    v.contiguous(),
+                )
+                for a, b in zip(actual, expected):
+                    torch.testing.assert_close(a, b, atol=0, rtol=0)
+                self.assertFalse(
+                    supports_kda_qkv_pack(q[..., :64], k[..., :64], v[..., :64])
+                )
+
+    @torch.inference_mode()
+    def test_fused_qkv_pack_preserves_state_and_tracking(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from sglang.kernels.ops.attention.fla import kda
+
+        torch.manual_seed(46)
+        mixed = torch.randn(1, 132, 3 * 2 * 128, device="cuda", dtype=torch.bfloat16)
+        q, k, v = [x.unflatten(-1, (2, 128)) for x in mixed.chunk(3, -1)]
+        gate = -torch.rand(q.shape, device="cuda") * 0.02
+        beta = torch.randn(q.shape[:-1], device="cuda")
+        pool = torch.randn(4, 2, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.001
+        indices = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
+        cu = torch.tensor([0, 65, 132], device="cuda", dtype=torch.int64)
+        snapshots = torch.zeros(2, device="cuda", dtype=torch.int32)
+
+        def run(enabled):
+            state = pool.clone()
+            track = torch.zeros(2, 2, 128, 128, device="cuda", dtype=torch.float32)
+            with patch.object(kda, "_FUSE_KDA_QKV_PACK", enabled):
+                output = kda.chunk_kda(
+                    q,
+                    k,
+                    v,
+                    gate.clone(),
+                    beta.clone(),
+                    initial_state=state,
+                    initial_state_indices=indices,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu,
+                    beta_is_raw=True,
+                    track_state=track,
+                    track_chunk_idx=snapshots,
+                )
+            return output, state, track
+
+        before, after = run(False), run(True)
+        for a, b in zip(after, before):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
     def test_helion_backend_ran(self):
         """Visibility hook: without helion installed the snapshot check above
         runs triton-only and the Helion track configs go untested — surface
